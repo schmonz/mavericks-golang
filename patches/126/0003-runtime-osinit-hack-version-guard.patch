@@ -1,0 +1,41 @@
+Guard the osinit_hack fork+exec-hang workaround so it runs only on macOS >= 10.12
+(Darwin 16), where notify_is_valid_token exists. On 10.9-10.11 it is skipped
+(symbol imported but never bound) and the binary runs. Provenance: adapted
+from the predecessor packaging's patch-src_runtime_sys__darwin.go.
+
+--- src/runtime/sys_darwin.go.orig
++++ src/runtime/sys_darwin.go
+@@ -185,13 +185,32 @@
+ //
+ //go:nosplit
+ func osinit_hack() {
+-	if GOOS == "darwin" { // not ios
++	if GOOS == "darwin" && osinit_hack_supported() { // not ios; skip pre-10.12 (notify_is_valid_token absent)
+ 		libcCall(unsafe.Pointer(abi.FuncPCABI0(osinit_hack_trampoline)), nil)
+ 	}
+ 	return
+ }
+ func osinit_hack_trampoline()
+
++// osinit_hack_supported reports whether osinit_hack should run. notify_is_valid_token
++// (called by the trampoline) exists only on macOS 10.12+ (Darwin 16+); on older
++// systems it is absent -- calling it dyld-faults -- and the fork+exec hang the hack
++// works around is not present, so the hack is skipped.
++func osinit_hack_supported() bool {
++	var buf [32]byte
++	if sysctlbynameBytes([]byte("kern.osrelease\x00"), buf[:]) != 0 {
++		return false
++	}
++	maj := 0
++	for _, c := range &buf {
++		if c < 0x30 || c > 0x39 {
++			break
++		}
++		maj = maj*10 + int(c-0x30)
++	}
++	return maj >= 16
++}
++
+ // mmap is used to do low-level memory allocation via mmap. Don't allow stack
+ // splits, since this function (used by sysAlloc) is called in a lot of low-level
+ // parts of the runtime and callers often assume it won't acquire any locks.

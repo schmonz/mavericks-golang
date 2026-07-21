@@ -1,0 +1,16 @@
+Inject the legacy-support link flags into the bootstrap-tools build. Read from
+the environment, appended only when set -> inert off old macOS. Provenance:
+adapted from the predecessor packaging's patch-src_cmd_dist_buildtool.go.
+
+--- src/cmd/dist/buildtool.go.orig
++++ src/cmd/dist/buildtool.go
+@@ -247,6 +247,9 @@
+ 		"install",
+ 		"-tags=math_big_pure_go compiler_bootstrap purego",
+ 	}
++	if extra := os.Getenv("GO_BOOTSTRAP_LDFLAGS"); extra != "" {
++		cmd = append(cmd, "-ldflags="+extra)
++	}
+ 	if vflag > 0 {
+ 		cmd = append(cmd, "-v")
+ 	}

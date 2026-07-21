@@ -1,0 +1,16 @@
+Inject the legacy-support link flags into the cmd/dist bootstrap build.
+GO_BOOTSTRAP_LDFLAGS is set only by build-native.sh; ${...:+...} is empty when
+unset, so this is inert off old macOS. Provenance: adapted from the
+predecessor packaging's patch-src_make.bash.
+
+--- src/make.bash.orig
++++ src/make.bash
+@@ -191,7 +191,7 @@
+ 	exit 1
+ fi
+ rm -f cmd/dist/dist
+-bootstrapenv "$GOROOT_BOOTSTRAP/bin/go" build -o cmd/dist/dist ./cmd/dist
++bootstrapenv "$GOROOT_BOOTSTRAP/bin/go" build ${GO_BOOTSTRAP_LDFLAGS:+-ldflags="$GO_BOOTSTRAP_LDFLAGS"} -o cmd/dist/dist ./cmd/dist
+
+ # -e doesn't propagate out of eval, so check success by hand.
+ eval $(./cmd/dist/dist env -p || echo FAIL=true)

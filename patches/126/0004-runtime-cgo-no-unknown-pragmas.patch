@@ -1,0 +1,20 @@
+Let the pre-10.12 system clang compile runtime/cgo when a cgo program is built
+ON the 10.9 box. Apple's system clang there is clang 6.0 (2014); its
+-Wunknown-pragmas warns on the newer diagnostic groups runtime/cgo suppresses
+(-Wpragmas, -Watomic-alignment), and runtime/cgo forces -Werror -> a fatal
+compile error. Append -Wno-unknown-pragmas last so it wins over the -Werror
+earlier on the line. Diagnostic-only, no codegen impact; runtime/cgo is the only
+non-test stdlib package that sets -Werror. Harmless with a modern host clang, so
+this ships in the cross toolchain too (the std cgo source is compiled on-box on
+first use). Provenance: adapted from the predecessor packaging's Makefile
+SUBST_CLASSES cgoclang.
+
+--- src/runtime/cgo/cgo.go.orig
++++ src/runtime/cgo/cgo.go
+@@ -26,7 +26,7 @@
+ // proper support functions. See issues #52919, #54313, #58385.
+ // Use -Wdeclaration-after-statement because some CI builds use it.
+-#cgo CFLAGS: -Wall -Werror -fno-stack-protector -Wdeclaration-after-statement
++#cgo CFLAGS: -Wall -Werror -fno-stack-protector -Wdeclaration-after-statement -Wno-unknown-pragmas
+
+ #cgo solaris CPPFLAGS: -D_POSIX_PTHREAD_SEMANTICS

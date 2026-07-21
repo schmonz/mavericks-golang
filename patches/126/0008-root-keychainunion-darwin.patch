@@ -1,0 +1,150 @@
+
+Darwin integration for the keychain-union trust model: enumerate the
+SYSTEM and ADMIN keychain trust domains (skipping USER, which can block on a
+GUI prompt and hang a headless daemon), build the union anchor pool via
+buildKeychainUnionPool, and install it into crypto/x509 at init with the pure-Go
+fallback verifier forced on for macOS too old for a working SecTrust engine
+(< 10.14, where it faults in-framework). @SSLDIR@ is substituted with the
+toolchain's CA-bundle directory by a Makefile SUBST at pre-configure. All identifiers unexported.
+
+This revives the keychain-anchor enumeration Go's own crypto/x509 performed
+before the 1.14 platform-verifier rewrite (reference: Go 1.13's
+crypto/x509/root_cgo_darwin.go, which read SecTrustSettings across the keychain
+domains); the logic is re-expressed here in the modern non-cgo trampoline style,
+not copied.
+
+--- src/crypto/x509/root_keychainunion_darwin.go.orig	2026-07-06 03:21:11.000000000 +0000
++++ src/crypto/x509/root_keychainunion_darwin.go
+@@ -0,0 +1,132 @@
++//go:build darwin
++
++package x509
++
++import (
++	"crypto/x509/internal/macos"
++	"os"
++	"strconv"
++	"strings"
++)
++
++// Enumerate SYSTEM(2) and ADMIN(1) only. The USER domain(0) is excluded: reading
++// it can block on a SecurityAgent GUI prompt, which would hang a headless daemon
++// like tailscaled. System+admin cover the real trust anchors.
++var keychainUnionTrustDomains = []int{2, 1}
++
++// CA-bundle discovery mirrors root_bsd.go's certFiles, plus the toolchain's own
++// CA-bundle path (@SSLDIR@ substituted at build time by a Makefile SUBST).
++var keychainUnionBundlePaths = []string{
++	"@SSLDIR@/certs/ca-certificates.crt",
++	"/usr/local/etc/openssl/cert.pem",
++	"/etc/openssl/certs/ca-certificates.crt",
++	"/etc/ssl/certs/ca-certificates.crt",
++	"/etc/ssl/cert.pem",
++}
++
++func keychainUnionEnumerateKeychain() []keychainUnionTrustEntry {
++	var out []keychainUnionTrustEntry
++	for _, dom := range keychainUnionTrustDomains {
++		certs, err := macos.SecTrustSettingsCopyCertificates(macos.SecTrustSettingsDomain(dom))
++		if err != nil {
++			continue // errSecNoTrustSettings etc. -> nothing in this domain
++		}
++		n := macos.CFArrayGetCount(certs)
++		for i := 0; i < n; i++ {
++			certRef := macos.CFArrayGetValueAtIndex(certs, i)
++			der, err := macos.SecCertificateCopyData(certRef)
++			if err != nil {
++				continue
++			}
++			out = append(out, keychainUnionTrustEntry{der: der, result: keychainUnionTrustResult(certRef, dom)})
++		}
++		macos.CFRelease(certs)
++	}
++	return out
++}
++
++// keychainUnionTrustResult reads kSecTrustSettingsResult for cert in domain. An empty
++// settings array == trust-as-root; a settings entry without an explicit result
++// also defaults to trust-as-root. Key access confirmed by spike: the constant is
++// a CFSTR literal, so StringToCFString("kSecTrustSettingsResult") is the key.
++func keychainUnionTrustResult(cert macos.CFRef, domain int) int {
++	settings, err := macos.SecTrustSettingsCopyTrustSettings(cert, macos.SecTrustSettingsDomain(domain))
++	if err != nil {
++		return keychainUnionTrustUnspec
++	}
++	defer macos.CFRelease(settings)
++	n := macos.CFArrayGetCount(settings)
++	if n == 0 {
++		return keychainUnionTrustRoot
++	}
++	key := macos.StringToCFString("kSecTrustSettingsResult")
++	defer macos.CFRelease(macos.CFRef(key))
++	for i := 0; i < n; i++ {
++		dict := macos.CFArrayGetValueAtIndex(settings, i)
++		if v, ok := macos.CFDictionaryGetValueIfPresent(dict, key); ok {
++			if r, err := macos.CFNumberGetValue(v); err == nil {
++				return int(r)
++			}
++		}
++	}
++	return keychainUnionTrustRoot
++}
++
++// keychainUnionReadDirNames lists a directory's entry names (for SSL_CERT_DIR).
++func keychainUnionReadDirNames(dir string) ([]string, error) {
++	ents, err := os.ReadDir(dir)
++	if err != nil {
++		return nil, err
++	}
++	names := make([]string, 0, len(ents))
++	for _, e := range ents {
++		names = append(names, e.Name())
++	}
++	return names, nil
++}
++
++func init() {
++	paths := keychainUnionResolveBundlePaths(os.Getenv, keychainUnionReadDirNames, keychainUnionBundlePaths)
++	pool, distrust := buildKeychainUnionPool(keychainUnionEnumerateKeychain(), paths)
++	if pool == nil {
++		return
++	}
++	systemRootsMu.Lock()
++	defer systemRootsMu.Unlock()
++	fallbacksSet = true
++	systemRoots = pool
++	keychainUnionDistrusted = distrust
++	// Default: fallback verifier ON unless explicitly disabled via
++	// GODEBUG=x509usefallbackroots=0. On macOS too old for a working native
++	// verifier (SecTrust faults there), force ON regardless of the setting.
++	useFallbackRoots = x509usefallbackroots.Value() != "0" || keychainUnionNativeVerifierBroken()
++}
++
++// keychainUnionNativeVerifierBroken reports whether Apple's SecTrust engine is unusable
++// from Go on this macOS (true on < 10.14; it faults in-framework). Reads
++// ProductVersion from SystemVersion.plist, present on every macOS.
++func keychainUnionNativeVerifierBroken() bool {
++	data, err := os.ReadFile("/System/Library/CoreServices/SystemVersion.plist")
++	if err != nil {
++		return false
++	}
++	s := string(data)
++	i := strings.Index(s, "<key>ProductVersion</key>")
++	if i < 0 {
++		return false
++	}
++	rest := s[i:]
++	a := strings.Index(rest, "<string>")
++	b := strings.Index(rest, "</string>")
++	if a < 0 || b < 0 || b < a {
++		return false
++	}
++	ver := rest[a+len("<string>") : b]
++	parts := strings.SplitN(ver, ".", 3)
++	if len(parts) < 2 {
++		return false
++	}
++	major, _ := strconv.Atoi(parts[0])
++	minor, _ := strconv.Atoi(parts[1])
++	return major < 10 || (major == 10 && minor < 14)
++}

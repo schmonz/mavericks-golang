@@ -1,0 +1,28 @@
+
+Honor keychain distrust at verify time (the distrust veto of the
+keychain-union trust model). Anchor exclusion alone rejects a distrusted root,
+but not a distrusted intermediate that the server supplies and that also chains
+to a legitimately-trusted root, since Go's CertPool has no denylist. This drops
+any built chain containing a keychain-distrusted cert. keychainUnionDistrusted lives in
+the no-build-tag union file and is populated only by the darwin init, so it is
+nil on every other platform and this check is inert there.
+
+--- src/crypto/x509/verify.go.orig	2026-07-06 03:23:51.000000000 +0000
++++ src/crypto/x509/verify.go
+@@ -603,6 +603,16 @@ func (c *Certificate) Verify(opts Verify
+ 		}
+ 	}
+ 
++	// Honor keychain distrust: drop any chain containing a
++	// keychain-distrusted cert (e.g. a distrusted intermediate that also chains
++	// to a trusted root). keychainUnionDistrusted is nil off-darwin, so this is inert.
++	if len(keychainUnionDistrusted) > 0 {
++		candidateChains = keychainUnionFilterDistrusted(candidateChains)
++		if len(candidateChains) == 0 {
++			return nil, UnknownAuthorityError{Cert: c}
++		}
++	}
++
+ 	anyKeyUsage := false
+ 	for _, eku := range opts.KeyUsages {
+ 		if eku == ExtKeyUsageAny {

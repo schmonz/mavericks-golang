@@ -1,0 +1,64 @@
+
+Restore the keychain trust-settings enumeration that upstream Go removed in 1.26.
+
+Go 1.18 through 1.24 shipped SecTrustSettingsCopyCertificates /
+SecTrustSettingsCopyTrustSettings (with the SecTrustSettingsDomain type and the
+ErrNoTrustSettings / errSec* helpers) in crypto/x509/internal/macos; Go 1.26
+deleted this now-unused code in the platform-verifier cleanup. The
+keychain-union trust model needs it back (go118-124 still have it natively).
+
+The added declarations are taken VERBATIM from Go 1.24, so they are byte-for-byte
+Go's own code (Copyright The Go Authors, BSD-3-Clause -- the same license as this
+file). Compare against the upstream source to confirm they are identical:
+
+  https://github.com/golang/go/blob/go1.24.13/src/crypto/x509/internal/macos/security.go
+  (SecTrustSettingsDomain + the two SecTrustSettingsCopy* funcs, ~lines 46-118)
+
+--- src/crypto/x509/internal/macos/security.go.orig	2026-05-29 11:26:39.000000000 -0400
++++ src/crypto/x509/internal/macos/security.go
+@@ -145,3 +145,45 @@
+ 	return CFRef(ret), nil
+ }
+ func x509_SecTrustCopyCertificateChain_trampoline()
++
++type SecTrustSettingsDomain int32
++
++const (
++	SecTrustSettingsDomainUser SecTrustSettingsDomain = iota
++	SecTrustSettingsDomainAdmin
++	SecTrustSettingsDomainSystem
++)
++
++var ErrNoTrustSettings = errors.New("no trust settings found")
++
++const errSecNoTrustSettings = -25263
++
++//go:cgo_import_dynamic x509_SecTrustSettingsCopyCertificates SecTrustSettingsCopyCertificates "/System/Library/Frameworks/Security.framework/Versions/A/Security"
++
++func SecTrustSettingsCopyCertificates(domain SecTrustSettingsDomain) (certArray CFRef, err error) {
++	ret := syscall(abi.FuncPCABI0(x509_SecTrustSettingsCopyCertificates_trampoline), uintptr(domain),
++		uintptr(unsafe.Pointer(&certArray)), 0, 0, 0, 0)
++	if int32(ret) == errSecNoTrustSettings {
++		return 0, ErrNoTrustSettings
++	} else if ret != 0 {
++		return 0, OSStatus{"SecTrustSettingsCopyCertificates", int32(ret)}
++	}
++	return certArray, nil
++}
++func x509_SecTrustSettingsCopyCertificates_trampoline()
++
++const errSecItemNotFound = -25300
++
++//go:cgo_import_dynamic x509_SecTrustSettingsCopyTrustSettings SecTrustSettingsCopyTrustSettings "/System/Library/Frameworks/Security.framework/Versions/A/Security"
++
++func SecTrustSettingsCopyTrustSettings(cert CFRef, domain SecTrustSettingsDomain) (trustSettings CFRef, err error) {
++	ret := syscall(abi.FuncPCABI0(x509_SecTrustSettingsCopyTrustSettings_trampoline), uintptr(cert), uintptr(domain),
++		uintptr(unsafe.Pointer(&trustSettings)), 0, 0, 0)
++	if int32(ret) == errSecItemNotFound {
++		return 0, ErrNoTrustSettings
++	} else if ret != 0 {
++		return 0, OSStatus{"SecTrustSettingsCopyTrustSettings", int32(ret)}
++	}
++	return trustSettings, nil
++}
++func x509_SecTrustSettingsCopyTrustSettings_trampoline()

@@ -1,0 +1,188 @@
+
+Cross-platform unit tests for buildKeychainUnionPool: a Deny'd keychain root is
+excluded from the anchor pool and recorded in the distrust set (a leaf must
+fail to verify against it), while a TrustRoot keychain root is admitted as an
+anchor (a leaf verifies against it). Uses a locally generated self-signed root
+and leaf, so it needs no build constraint and no real keychain.
+
+--- src/crypto/x509/root_keychainunion_test.go.orig	2026-07-06 03:21:11.000000000 +0000
++++ src/crypto/x509/root_keychainunion_test.go
+@@ -0,0 +1,178 @@
++package x509
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509/pkix"
++	"encoding/pem"
++	"math/big"
++	"os"
++	"testing"
++	"time"
++)
++
++// keychainUnionTestChain builds a self-signed root CA and a leaf signed by it.
++func keychainUnionTestChain(t *testing.T) (root, leaf *Certificate) {
++	t.Helper()
++	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	rootTmpl := &Certificate{
++		SerialNumber:          big.NewInt(1),
++		Subject:               pkix.Name{CommonName: "keychainUnion test root"},
++		NotBefore:             time.Now().Add(-time.Hour),
++		NotAfter:              time.Now().Add(time.Hour),
++		IsCA:                  true,
++		BasicConstraintsValid: true,
++		KeyUsage:              KeyUsageCertSign,
++	}
++	rootDER, err := CreateCertificate(rand.Reader, rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	root, err = ParseCertificate(rootDER)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	leafTmpl := &Certificate{
++		SerialNumber: big.NewInt(2),
++		Subject:      pkix.Name{CommonName: "leaf"},
++		NotBefore:    time.Now().Add(-time.Hour),
++		NotAfter:     time.Now().Add(time.Hour),
++		KeyUsage:     KeyUsageDigitalSignature,
++		ExtKeyUsage:  []ExtKeyUsage{ExtKeyUsageServerAuth},
++	}
++	leafDER, err := CreateCertificate(rand.Reader, leafTmpl, root, &leafKey.PublicKey, rootKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	leaf, err = ParseCertificate(leafDER)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return root, leaf
++}
++
++func TestBuildKeychainUnionPool_DenyRootExcluded(t *testing.T) {
++	root, leaf := keychainUnionTestChain(t)
++	pool, distrust := buildKeychainUnionPool([]keychainUnionTrustEntry{{der: root.Raw, result: keychainUnionTrustDeny}}, nil)
++	if _, err := leaf.Verify(VerifyOptions{Roots: pool, CurrentTime: time.Now()}); err == nil {
++		t.Fatal("leaf verified against a Deny'd root; distrust not honored")
++	}
++	if !distrust[keychainUnionFingerprint(root.Raw)] {
++		t.Fatal("Deny'd root missing from distrust set")
++	}
++}
++
++func TestBuildKeychainUnionPool_TrustRootAdmitted(t *testing.T) {
++	root, leaf := keychainUnionTestChain(t)
++	pool, _ := buildKeychainUnionPool([]keychainUnionTrustEntry{{der: root.Raw, result: keychainUnionTrustRoot}}, nil)
++	if _, err := leaf.Verify(VerifyOptions{Roots: pool, CurrentTime: time.Now()}); err != nil {
++		t.Fatalf("leaf failed against a TrustRoot anchor: %v", err)
++	}
++}
++
++// keychainUnionTestChain3 builds root CA -> intermediate CA -> leaf.
++func keychainUnionTestChain3(t *testing.T) (root, inter, leaf *Certificate) {
++	t.Helper()
++	rootKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	rootTmpl := &Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "keychainUnion root"},
++		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
++		IsCA: true, BasicConstraintsValid: true, KeyUsage: KeyUsageCertSign}
++	rootDER, _ := CreateCertificate(rand.Reader, rootTmpl, rootTmpl, &rootKey.PublicKey, rootKey)
++	root, _ = ParseCertificate(rootDER)
++
++	interKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	interTmpl := &Certificate{SerialNumber: big.NewInt(2), Subject: pkix.Name{CommonName: "keychainUnion inter"},
++		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
++		IsCA: true, BasicConstraintsValid: true, KeyUsage: KeyUsageCertSign}
++	interDER, _ := CreateCertificate(rand.Reader, interTmpl, root, &interKey.PublicKey, rootKey)
++	inter, _ = ParseCertificate(interDER)
++
++	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	leafTmpl := &Certificate{SerialNumber: big.NewInt(3), Subject: pkix.Name{CommonName: "leaf"},
++		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
++		KeyUsage: KeyUsageDigitalSignature, ExtKeyUsage: []ExtKeyUsage{ExtKeyUsageServerAuth}}
++	leafDER, _ := CreateCertificate(rand.Reader, leafTmpl, inter, &leafKey.PublicKey, interKey)
++	leaf, _ = ParseCertificate(leafDER)
++	return root, inter, leaf
++}
++
++func TestKeychainUnionVeto_DistrustedIntermediateRejected(t *testing.T) {
++	root, inter, leaf := keychainUnionTestChain3(t)
++	roots := NewCertPool()
++	roots.AddCert(root)
++	inters := NewCertPool()
++	inters.AddCert(inter)
++	// baseline: with no distrust set, the chain verifies (leaf<-inter<-root).
++	keychainUnionDistrusted = nil
++	if _, err := leaf.Verify(VerifyOptions{Roots: roots, Intermediates: inters, CurrentTime: time.Now()}); err != nil {
++		t.Fatalf("baseline should verify: %v", err)
++	}
++	// distrust the intermediate: the veto must reject even though root is trusted.
++	keychainUnionDistrusted = map[[32]byte]bool{keychainUnionFingerprint(inter.Raw): true}
++	defer func() { keychainUnionDistrusted = nil }()
++	if _, err := leaf.Verify(VerifyOptions{Roots: roots, Intermediates: inters, CurrentTime: time.Now()}); err == nil {
++		t.Fatal("distrusted intermediate was NOT rejected by the veto")
++	}
++}
++
++func TestKeychainUnionResolveBundlePaths(t *testing.T) {
++	defaults := []string{"/d/one", "/d/two"}
++	rd := func(dir string) ([]string, error) {
++		if dir == "/certs.d" {
++			return []string{"a.pem", "b.pem"}, nil
++		}
++		return nil, os.ErrNotExist
++	}
++	env := func(m map[string]string) func(string) string {
++		return func(k string) string { return m[k] }
++	}
++	// no env -> defaults
++	if got := keychainUnionResolveBundlePaths(env(nil), rd, defaults); len(got) != 2 || got[0] != "/d/one" {
++		t.Fatalf("no-env: got %v", got)
++	}
++	// SSL_CERT_FILE replaces the file list
++	if got := keychainUnionResolveBundlePaths(env(map[string]string{"SSL_CERT_FILE": "/my/ca.pem"}), rd, defaults); len(got) != 1 || got[0] != "/my/ca.pem" {
++		t.Fatalf("SSL_CERT_FILE: got %v", got)
++	}
++	// SSL_CERT_DIR (colon list) adds dir entries; empty and missing dirs skipped
++	got := keychainUnionResolveBundlePaths(env(map[string]string{"SSL_CERT_DIR": "/certs.d:/missing.d:"}), rd, defaults)
++	want := []string{"/d/one", "/d/two", "/certs.d/a.pem", "/certs.d/b.pem"}
++	if len(got) != len(want) {
++		t.Fatalf("SSL_CERT_DIR: got %v want %v", got, want)
++	}
++	for i := range want {
++		if got[i] != want[i] {
++			t.Fatalf("SSL_CERT_DIR[%d]: got %q want %q", i, got[i], want[i])
++		}
++	}
++	// both: FILE replaces defaults, DIR appends
++	got = keychainUnionResolveBundlePaths(env(map[string]string{"SSL_CERT_FILE": "/f", "SSL_CERT_DIR": "/certs.d"}), rd, defaults)
++	if len(got) != 3 || got[0] != "/f" || got[1] != "/certs.d/a.pem" {
++		t.Fatalf("both: got %v", got)
++	}
++}
++
++// A cert present only in a user bundle file (as SSL_CERT_FILE would point to) is
++// unioned into the anchor pool alongside the keychain.
++func TestKeychainUnionUserBundleTrusted(t *testing.T) {
++	root, leaf := keychainUnionTestChain(t)
++	bundle := t.TempDir() + "/ca.pem"
++	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw})
++	if err := os.WriteFile(bundle, pemBytes, 0o644); err != nil {
++		t.Fatal(err)
++	}
++	// no keychain entries, bundle-only
++	pool, _ := buildKeychainUnionPool(nil, []string{bundle})
++	if _, err := leaf.Verify(VerifyOptions{Roots: pool, CurrentTime: time.Now()}); err != nil {
++		t.Fatalf("leaf failed against a user-bundle root: %v", err)
++	}
++}
