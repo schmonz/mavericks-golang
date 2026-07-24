@@ -45,7 +45,7 @@ jobs:
         run: softwareupdate --install-rosetta --agree-to-license || true
 
       - name: Bootstrap Go (arm64, >= 1.24)
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with: { go-version: '1.26.x' }
 
       - name: pkgsrc rename guard
